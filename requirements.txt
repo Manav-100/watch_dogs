@@ -1,0 +1,8 @@
+opencv-python
+numpy
+torch
+torchvision
+insightface
+onnxruntime
+bytetracker
+lapx
