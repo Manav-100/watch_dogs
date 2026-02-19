@@ -1,164 +1,191 @@
-import nltk
-from nltk.corpus import wordnet as wn
-import pandas as pd
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import cv2
+import numpy as np
+import os
+import re
 
-# --- Step 1: Download WordNet Database ---
-print("Downloading WordNet data (this may take a moment)...")
-nltk.download('wordnet', quiet=True)
-nltk.download('omw-1.4', quiet=True)
-nltk.download('averaged_perceptron_tagger', quiet=True)
-print("Download complete. Starting extraction...")
+from siamese_model import FaceDetector
+from custom_model import FaceEncoder
+from insightface.utils import face_align 
+from model.distortion_simulation import custom_distortion_pipeline
 
-# --- Step 2: Define Helper Functions ---
+# --- CONFIGURATION ---
+IMG_1_PATH = r"D:\College\Vscode\watchdogs\test\similarity_test_photos\akshay_kumar_1.jpg"
+IMG_2_PATH = r"D:\College\Vscode\watchdogs\test\similarity_test_photos\akshay_kumar_2.jpg"
 
-def get_pos_set(word):
-    """
-    Checks if a word exists in WordNet as a Noun, Verb, Adj, or Adv.
-    """
-    pos_set = set()
-    if wn.synsets(word, pos=wn.NOUN): pos_set.add('Noun')
-    if wn.synsets(word, pos=wn.VERB): pos_set.add('Verb')
-    if wn.synsets(word, pos=wn.ADJ) or wn.synsets(word, pos=wn.ADJ_SAT): pos_set.add('Adj')
-    if wn.synsets(word, pos=wn.ADV): pos_set.add('Adv')
+CHECKPOINTS = {
+    "Model_V1": r"trained/bollywood_faces/v2.16/epoch_18.pth",
+    "Model_V2": r"trained/bollywood_faces/v1(3,5)/epoch_19.pth" 
+}
+
+DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+# --- 1. DYNAMIC MODEL ARCHITECTURE ---
+class DynamicAttentionHead(nn.Module):
+    def __init__(self, attn_modules, clf_modules):
+        super().__init__()
+        self.attn = nn.Sequential(*attn_modules)
+        self.classifier = nn.Sequential(*clf_modules)
+
+    def forward(self, e1, e2):
+        # We perform the forward pass steps manually in the loop below 
+        # for debugging purposes, but this is the standard logic:
+        diff = torch.abs(e1 - e2)
+        concat = torch.cat([e1, e2], dim=1)
+        weights = self.attn(concat)
+        weighted = diff * weights
+        return self.classifier(weighted).squeeze(1)
+
+# --- 2. FACTORY: Build Model from Checkpoint ---
+def build_model_from_checkpoint(checkpoint_path):
+    print(f"[{os.path.basename(checkpoint_path)}] Analyzing...")
+    try:
+        state_dict = torch.load(checkpoint_path, map_location=DEVICE)
+    except Exception as e:
+        print(f"   -> Error loading file: {e}")
+        return None
+
+    # A. Clean Keys (Remove 'head.' prefix)
+    clean_state = {}
+    for k, v in state_dict.items():
+        if k.startswith("head."):
+            clean_state[k.replace("head.", "")] = v
+        elif "encoder" not in k:
+            clean_state[k] = v
+            
+    # B. Identify Layer Structure via Regex
+    attn_indices = [int(x) for x in re.findall(r'attn\.(\d+)\.weight', str(clean_state.keys()))]
+    clf_indices = [int(x) for x in re.findall(r'classifier\.(\d+)\.weight', str(clean_state.keys()))]
     
-    # Heuristics for words like "running" (Participles)
-    if word.endswith('ing'): pos_set.add('Verb')
+    if not attn_indices or not clf_indices:
+        print("   -> Failed to identify layer structure.")
+        return None
+
+    max_attn = max(attn_indices)
+    max_clf = max(clf_indices)
+
+    # C. Reconstruct 'attn' Block
+    attn_layers = []
+    for i in range(0, max_attn + 1):
+        w_key = f"attn.{i}.weight"
+        b_key = f"attn.{i}.bias"
+        
+        if w_key in clean_state: # Linear Layer
+            weight = clean_state[w_key]
+            out_f, in_f = weight.shape
+            layer = nn.Linear(in_f, out_f)
+            layer.weight.data = weight
+            if b_key in clean_state:
+                layer.bias.data = clean_state[b_key]
+            attn_layers.append(layer)
+        elif i == max_attn and "Sigmoid" not in str(attn_layers[-1]):
+             # End of block usually has Sigmoid
+             pass 
+        elif i % 2 != 0: 
+             # Odd indices are usually ReLUs
+             attn_layers.append(nn.ReLU())
+
+    # Force Final Sigmoid for Attn
+    if not isinstance(attn_layers[-1], nn.Sigmoid):
+        attn_layers.append(nn.Sigmoid())
+
+    # D. Reconstruct 'classifier' Block
+    clf_layers = []
+    for i in range(0, max_clf + 1):
+        w_key = f"classifier.{i}.weight"
+        b_key = f"classifier.{i}.bias"
+        
+        if w_key in clean_state:
+            weight = clean_state[w_key]
+            out_f, in_f = weight.shape
+            layer = nn.Linear(in_f, out_f)
+            layer.weight.data = weight
+            if b_key in clean_state:
+                layer.bias.data = clean_state[b_key]
+            clf_layers.append(layer)
+        elif i % 2 != 0:
+            clf_layers.append(nn.ReLU())
+
+    # E. Build & Return
+    model = DynamicAttentionHead(attn_layers, clf_layers).to(DEVICE)
+    model.eval()
     
-    return pos_set
+    # Debug: Print first few layers to confirm construction
+    print(f"   -> Built: {len(attn_layers)} Attn Layers / {len(clf_layers)} Clf Layers")
+    return model
 
-def generate_formatted_meaning(w1, w2, pattern):
-    """
-    Creates the structured 'meaning' phrase (e.g., 'a bird that is blue').
-    """
-    w1_clean = w1.replace('_', ' ')
-    w2_clean = w2.replace('_', ' ')
+# --- SETUP ---
+print("\nInitializing Encoders...")
+detector_detect = FaceDetector(device=DEVICE)
+onnx_encoder = FaceDetector(device=DEVICE, embed=True).app.models['recognition']
+base_encoder = FaceEncoder(onnx_encoder)
+
+def get_aligned_face(path):
+    img = cv2.imread(path)
+    if img is None: return None
+    results = detector_detect.detect(img)
+    if not results: return None
+    return face_align.norm_crop(img, landmark=results[0]["landmarks"])
+
+def to_tensor(img_bgr):
+    img_uint8 = img_bgr.astype(np.uint8)
+    return torch.from_numpy(img_uint8).permute(2, 0, 1).unsqueeze(0).float().to(DEVICE)
+
+# --- EXECUTION ---
+print("Processing Images...")
+face1 = get_aligned_face(IMG_1_PATH)
+face2 = get_aligned_face(IMG_2_PATH)
+
+if face1 is None or face2 is None:
+    exit("Detection failed for one or more images.")
+
+# Optional: Distortion
+dist_res = custom_distortion_pipeline(image=face2)
+face2_dist = dist_res["image"]
+t1 = to_tensor(face1)
+t2 = to_tensor(face2_dist)
+
+# --- COMPARISON TABLE ---
+print("\n" + "="*95)
+print(f"{'Model':<12} | {'Attn Mean':<10} | {'Attn Max':<10} | {'Raw Cos':<8} | {'Prob %':<8} | {'Verdict'}")
+print("-" * 95)
+
+with torch.no_grad():
+    # Pre-calculate embeddings once
+    raw_e1 = base_encoder(t1)
+    raw_e2 = base_encoder(t2)
+    if raw_e1.dim() == 1: raw_e1 = raw_e1.unsqueeze(0)
+    if raw_e2.dim() == 1: raw_e2 = raw_e2.unsqueeze(0)
     
-    # Determine proper article (a/an)
-    article = "an" if w2_clean[0].lower() in 'aeiou' else "a"
-    article_w1 = "an" if w1_clean[0].lower() in 'aeiou' else "a"
+    # Normalize (CRITICAL)
+    e1_norm = F.normalize(raw_e1, p=2, dim=1)
+    e2_norm = F.normalize(raw_e2, p=2, dim=1)
+    cosine = F.cosine_similarity(e1_norm, e2_norm).item()
 
-    definition = ""
-
-    # --- NOUN PATTERNS ---
-    if pattern == 'Adj + Noun':
-        # "blue_bird" -> "a bird that is blue"
-        definition = f"{article} {w2_clean} that is {w1_clean}"
-
-    elif pattern == 'Verb + Noun':
-        # "running_shoes" -> "shoes for running"
-        if w1.endswith('ing'):
-            definition = f"{article} {w2_clean} for {w1_clean}"
+    for name, path in CHECKPOINTS.items():
+        model = build_model_from_checkpoint(path)
+        
+        if model:
+            # --- MANUAL FORWARD PASS (To Inspect Internals) ---
+            diff = torch.abs(e1_norm - e2_norm)
+            concat = torch.cat([e1_norm, e2_norm], dim=1)
+            
+            # 1. Inspect Attention
+            attn_weights = model.attn(concat)
+            attn_mean = attn_weights.mean().item()
+            attn_max = attn_weights.max().item()
+            
+            # 2. Finish Calculation
+            weighted = diff * attn_weights
+            logit = model.classifier(weighted).squeeze(1)
+            prob = torch.sigmoid(logit).item()
+            
+            verdict = "MATCH" if prob > 0.5 else "NO MATCH"
+            
+            print(f"{name:<12} | {attn_mean:.4f}     | {attn_max:.4f}     | {cosine:.4f}   | {prob:.4f}   | {verdict}")
         else:
-            # "drift_wood" -> "wood that drifts"
-            verb = w1_clean
-            if not verb.endswith('s'): verb += "s"
-            definition = f"{article} {w2_clean} that {verb}"
+            print(f"{name:<12} | {'ERROR':<10} | {'ERROR':<10} | {cosine:.4f}   | {'ERROR':<8} | ERROR")
 
-    elif pattern == 'Noun + Verb':
-        # "sun_rise" -> "a sun that rises"
-        verb = w2_clean
-        if not verb.endswith('s'): verb += "s"
-        definition = f"{article} {w1_clean} that {verb}"
-        
-    elif pattern == 'Noun + Adj':
-        # "knight_errant" -> "a knight that is errant"
-        definition = f"{article} {w1_clean} that is {w2_clean}"
-
-    # --- VERB PATTERNS ---
-    elif pattern == 'Phrasal Verb (Verb + Adv)':
-        # "give_up" -> "to give up"
-        definition = f"to {w1_clean} {w2_clean}"
-
-    elif pattern == 'Phrasal Verb (Verb + Noun)':
-        # "make_love" -> "to make love"
-        definition = f"to {w1_clean} {w2_clean}"
-        
-    elif pattern == 'Phrasal Verb (Noun + Verb)':
-        # "baby_sit" -> "to sit a baby"
-        definition = f"to {w2_clean} {article_w1} {w1_clean}"
-
-    return definition
-
-# --- Step 3: Main Extraction Logic ---
-
-def extract_all_combinations():
-    results = []
-    seen_phrases = set()
-    
-    # We loop through both Noun and Verb synsets
-    target_pos = {'n': 'Noun', 'v': 'Verb'}
-
-    for pos_key, pos_type in target_pos.items():
-        print(f"Scanning {pos_type}s...")
-        
-        for synset in wn.all_synsets(pos_key):
-            for lemma in synset.lemmas():
-                phrase = lemma.name()
-                
-                # Filter for exactly 2-word phrases (WordNet uses underscores)
-                if phrase.count('_') == 1:
-                    parts = phrase.split('_')
-                    w1, w2 = parts[0].lower(), parts[1].lower()
-                    
-                    # Skip numbers or symbols
-                    if not w1.isalpha() or not w2.isalpha(): continue
-                    
-                    # Avoid duplicates
-                    if phrase in seen_phrases: continue
-
-                    # Check Part of Speech of individual words
-                    pos1 = get_pos_set(w1)
-                    pos2 = get_pos_set(w2)
-                    
-                    pattern = None
-
-                    # --- LOGIC FOR NOUN COMPOUNDS ---
-                    if pos_type == 'Noun':
-                        if 'Adj' in pos1 and 'Noun' in pos2:
-                            pattern = 'Adj + Noun'
-                        elif 'Verb' in pos1 and 'Noun' in pos2:
-                            pattern = 'Verb + Noun'
-                        elif 'Noun' in pos1 and 'Verb' in pos2:
-                            pattern = 'Noun + Verb'
-                        elif 'Noun' in pos1 and 'Adj' in pos2:
-                            pattern = 'Noun + Adj'
-
-                    # --- LOGIC FOR VERB COMPOUNDS ---
-                    elif pos_type == 'Verb':
-                        if 'Verb' in pos1 and 'Adv' in pos2:
-                            pattern = 'Phrasal Verb (Verb + Adv)'
-                        elif 'Verb' in pos1 and 'Noun' in pos2:
-                            pattern = 'Phrasal Verb (Verb + Noun)'
-                        elif 'Noun' in pos1 and 'Verb' in pos2:
-                            pattern = 'Phrasal Verb (Noun + Verb)'
-
-                    if pattern:
-                        # 1. Get the actual dictionary definition
-                        original_def = synset.definition()
-                        
-                        # 2. Generate the formatted meaning
-                        generated_def = generate_formatted_meaning(w1, w2, pattern)
-
-                        results.append({
-                            'Phrase': phrase.replace('_', ' '),
-                            'Pattern': pattern,
-                            'Generated_Meaning': generated_def,
-                            'Original_Definition': original_def
-                        })
-                        seen_phrases.add(phrase)
-
-    return pd.DataFrame(results)
-
-# --- Step 4: Run and Save ---
-df = extract_all_combinations()
-
-# Remove empty entries if any
-df = df[df['Generated_Meaning'] != ""]
-
-# Save to CSV
-output_file = 'WordNet_Complete_Combinations.csv'
-df.to_csv(output_file, index=False)
-
-print(f"\nSuccess! Processed {len(df)} combinations.")
-print(f"Saved to: {output_file}")
-print(df.head(10))
+print("="*95)
