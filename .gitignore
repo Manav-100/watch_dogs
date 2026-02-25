@@ -2,3 +2,5 @@ datasets/
 watch_env/
 watch_dogs_v2_code_only.rar
 __pycache__/
+test/sota_test/tinyface/
+test/sota_test/model_weights/

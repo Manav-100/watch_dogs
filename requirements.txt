@@ -1,8 +1,11 @@
 opencv-python
 numpy
-torch
-torchvision
+torch --index-url https://download.pytorch.org/whl/cu130
+torchvision --index-url https://download.pytorch.org/whl/cu130
 insightface
 onnxruntime
 bytetracker
 lapx
+matplotlib
+tqdm
+scikit-learn
