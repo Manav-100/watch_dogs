@@ -12,12 +12,12 @@ from insightface.utils import face_align
 from model.distortion_simulation import custom_distortion_pipeline
 
 # --- CONFIGURATION ---
-IMG_1_PATH = r"D:\College\Vscode\watchdogs\test\similarity_test_photos\akshay_kumar_1.jpg"
-IMG_2_PATH = r"D:\College\Vscode\watchdogs\test\similarity_test_photos\akshay_kumar_2.jpg"
+IMG_1_PATH = r"D:\cctv\watch_dogs\test\similarity_test_photos\neha_1.jpg"
+IMG_2_PATH = r"D:\cctv\watch_dogs\test\similarity_test_photos\neha_2.jpg"
 
 CHECKPOINTS = {
-    "Model_V1": r"trained/bollywood_faces/v2.16/epoch_18.pth",
-    "Model_V2": r"trained/bollywood_faces/v1(3,5)/epoch_19.pth" 
+    "Model_V1": r"trained/bollywood_faces/v2.16/epoch_3.pth",
+    "Model_V2": r"trained/bollywood_faces/v2.32_margin/epoch_3.pth" 
 }
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -136,7 +136,8 @@ def to_tensor(img_bgr):
 # --- EXECUTION ---
 print("Processing Images...")
 face1 = get_aligned_face(IMG_1_PATH)
-face2 = get_aligned_face(IMG_2_PATH)
+#face2 = get_aligned_face(IMG_2_PATH)
+face2=cv2.imread(IMG_2_PATH)
 
 if face1 is None or face2 is None:
     exit("Detection failed for one or more images.")
@@ -145,7 +146,8 @@ if face1 is None or face2 is None:
 dist_res = custom_distortion_pipeline(image=face2)
 face2_dist = dist_res["image"]
 t1 = to_tensor(face1)
-t2 = to_tensor(face2_dist)
+#t2 = to_tensor(face2_dist)
+t2=to_tensor(face2)
 
 # --- COMPARISON TABLE ---
 print("\n" + "="*95)
@@ -156,6 +158,15 @@ with torch.no_grad():
     # Pre-calculate embeddings once
     raw_e1 = base_encoder(t1)
     raw_e2 = base_encoder(t2)
+    
+    # 1. Ensure they are tensors (just in case ONNX returned raw numpy arrays)
+    if not isinstance(raw_e1, torch.Tensor): raw_e1 = torch.tensor(raw_e1)
+    if not isinstance(raw_e2, torch.Tensor): raw_e2 = torch.tensor(raw_e2)
+    
+    # 2. Push them to the GPU
+    raw_e1 = raw_e1.to(DEVICE)
+    raw_e2 = raw_e2.to(DEVICE)
+    
     if raw_e1.dim() == 1: raw_e1 = raw_e1.unsqueeze(0)
     if raw_e2.dim() == 1: raw_e2 = raw_e2.unsqueeze(0)
     
@@ -187,5 +198,3 @@ with torch.no_grad():
             print(f"{name:<12} | {attn_mean:.4f}     | {attn_max:.4f}     | {cosine:.4f}   | {prob:.4f}   | {verdict}")
         else:
             print(f"{name:<12} | {'ERROR':<10} | {'ERROR':<10} | {cosine:.4f}   | {'ERROR':<8} | ERROR")
-
-print("="*95)
