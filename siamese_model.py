@@ -3,16 +3,21 @@ import numpy as np
 from insightface.app.face_analysis import FaceAnalysis
 
 class FaceDetector:
-    def __init__(self, device="cpu",embed=False):
-        providers = ["CPUExecutionProvider"]
+    def __init__(self, device="cuda", embed=False):
+        self.embed = embed
+        # We explicitly prioritize CUDA and give it the correct device ID
         if device == "cuda":
-            providers = ["CUDAExecutionProvider"]
-        if not embed:
-            self.embed = False
-            self.app = FaceAnalysis(name="buffalo_l", providers=providers, allowed_modules=['detection'])
+            providers = [
+                ('CUDAExecutionProvider', {
+                    'device_id': 0, # Uses your first GPU
+                }),
+                'CPUExecutionProvider',
+            ]
         else:
-            self.embed = True
-            self.app = FaceAnalysis(name="buffalo_l", providers=providers)
+            providers = ['CPUExecutionProvider']
+
+        # Ensure FaceAnalysis uses these specific providers
+        self.app = FaceAnalysis(name="buffalo_l", providers=providers)
         self.app.prepare(ctx_id=0 if device=="cuda" else -1, det_size=(640, 640))
 
     def detect(self, frame):
