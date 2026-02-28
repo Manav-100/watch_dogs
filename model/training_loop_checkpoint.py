@@ -1,110 +1,234 @@
+import sys
+import os
+import time
+import logging
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
-from model.attention_head import AttentionHead
-from model.dataset import PairDataset
-from siamese_model import FaceDetector
-import os
+from torch.utils.data import DataLoader, random_split
+from tqdm import tqdm
 
-# --- SETUP ---
+# ==========================================
+# 1. SYSTEM SETUP & PATH INJECTION
+# ==========================================
+REPO_DIR = "D:\\cctv\\watch_dogs"
+if REPO_DIR not in sys.path:
+    sys.path.append(REPO_DIR)
+
+try:
+    from model.dataset import PairDataset
+    from siamese_model import FaceDetector
+    print("[SETUP] Core modules imported successfully.")
+except ImportError as e:
+    print(f"[CRITICAL ERROR] Failed to import modules. Ensure your repo is at {REPO_DIR}\nError: {e}")
+    sys.exit(1)
+
+# ==========================================
+# 2. INLINE MODEL DEFINITION (MULTI-EXIT)
+# ==========================================
+class AttentionHead(nn.Module):
+    def __init__(self, dim=512):
+        super().__init__()
+        # Concatenated input is 1024 (dim * 2)
+
+        # 1. THE HARD EXIT
+        self.layer1_hard = nn.Linear(dim * 2, 512)
+        self.hard_classifier = nn.Sequential(
+            nn.ReLU(), nn.Linear(512, 128),
+            nn.ReLU(), nn.Linear(128, 1)
+        )
+
+        # 2. THE MEDIUM EXIT
+        self.layer2_medium = nn.Linear(512, 128)
+        self.medium_classifier = nn.Sequential(
+            nn.ReLU(), nn.Linear(128, 64),
+            nn.ReLU(), nn.Linear(64, 1)
+        )
+
+        # 3. THE EASY EXIT
+        self.layer3_easy = nn.Linear(128, 32)
+        self.easy_classifier = nn.Sequential(
+            nn.ReLU(), nn.Linear(32, 16),
+            nn.ReLU(), nn.Linear(16, 1)
+        )
+
+    def forward(self, e1, e2, confidence_threshold=1.5, return_all=False):
+        concat = torch.cat([e1, e2], dim=1)
+
+        x_hard = self.layer1_hard(concat)
+        logits_hard = self.hard_classifier(x_hard)
+
+        x_medium = self.layer2_medium(F.relu(x_hard))
+        logits_medium = self.medium_classifier(x_medium)
+
+        x_easy = self.layer3_easy(F.relu(x_medium))
+        logits_easy = self.easy_classifier(x_easy)
+
+        # Return all logits if training OR if explicitly requested for validation scoring
+        if self.training or return_all:
+            return logits_hard, logits_medium, logits_easy
+
+        conf_hard = torch.abs(logits_hard)
+        conf_medium = torch.abs(logits_medium)
+
+        use_hard = (conf_hard >= confidence_threshold)
+        use_medium = (~use_hard) & (conf_medium >= confidence_threshold)
+        use_easy = (~use_hard) & (~use_medium)
+
+        final_logits = torch.zeros_like(logits_hard)
+        final_logits[use_hard] = logits_hard[use_hard]
+        final_logits[use_medium] = logits_medium[use_medium]
+        final_logits[use_easy] = logits_easy[use_easy]
+
+        return final_logits
+
+# ==========================================
+# 3. STANDARD CHECKPOINT LOADER
+# ==========================================
+def load_cascade_model(checkpoint_path, model, device):
+    print(f"\n[LOADER] Attempting to load: {checkpoint_path}")
+    if not os.path.exists(checkpoint_path):
+        print(f"[LOADER] Checkpoint file not found. Starting fresh.")
+        return model
+
+    try:
+        state_dict = torch.load(checkpoint_path, map_location=device)
+        clean_state = {k.replace("head.", "").replace("module.", ""): v for k, v in state_dict.items()}
+        model.load_state_dict(clean_state, strict=False)
+        print("[LOADER] SUCCESS: Cascade model weights loaded.")
+    except Exception as e:
+        print(f"[LOADER] CRITICAL ERROR during loading: {e}. Starting fresh.")
+    
+    return model
+
+# ==========================================
+# 4. TRAINING CONFIGURATION & DATA SPLIT
+# ==========================================
 pwd = os.getcwd()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Training on: {device}")
 
-# --- NEW CONFIGURATION ---
-# Path to the model you want to load (set to None if starting fresh)
-RESUME_CHECKPOINT = os.path.join(pwd, "trained", "bollywood_faces", "v1", "epoch_3.pth") 
+RESUME_CHECKPOINT = "D:\\cctv\\watch_dogs\\trained\\bollywood_faces\\v2.32_margin_exit\\epoch_3.pth" 
 
-# New lower learning rate (e.g., 1e-5 is 10x smaller than your original 1e-4)
-NEW_LR = 1e-5 
-
-# How many *additional* epochs you want to train
-ADDITIONAL_EPOCHS = 16 
-
-# 1. Initialize Encoder
+print("[INIT] Loading Face Detector...")
 detector = FaceDetector(device=device, embed=True)
 
-# 2. Dataset
-dataset = PairDataset(
-    parent_dir=r"d:\College\Vscode\watchdogs\datasets\ms1m_arcface\raw", 
+print("[INIT] Loading Dataset...")
+full_dataset = PairDataset(
+    parent_dir="D:\\cctv\\watch_dogs\\ms1m-arcface",
     encoder=detector.app.models['recognition']
 )
-loader = DataLoader(dataset, batch_size=64, shuffle=True)
 
-# 3. Model
-model = AttentionHead().to(device)
+# Split dataset into 90% Training, 10% Validation
+val_size = int(len(full_dataset) * 0.1)
+train_size = len(full_dataset) - val_size
+train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-# --- LOAD CHECKPOINT LOGIC ---
-start_epoch = 0
+train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
 
-if RESUME_CHECKPOINT and os.path.exists(RESUME_CHECKPOINT):
-    print(f"Loading checkpoint from: {RESUME_CHECKPOINT}")
-    # Load the weights into the model
-    model.load_state_dict(torch.load(RESUME_CHECKPOINT, map_location=device))
-    
-    # Extract the epoch number from the filename so we don't overwrite files
-    # Assuming format "epoch_X.pth"
-    try:
-        filename = os.path.basename(RESUME_CHECKPOINT)
-        last_epoch_num = int(filename.split('_')[1].split('.')[0])
-        start_epoch = last_epoch_num + 1
-        print(f"Resuming from Epoch {start_epoch}")
-    except:
-        print("Could not parse epoch number. Starting count from 0.")
-else:
-    print("No checkpoint found or specified. Starting fresh training.")
+print(f"[INIT] Total Pairs: {len(full_dataset)} | Training: {train_size} | Validation: {val_size}")
 
-# 4. Optimizer & Loss
+model = AttentionHead(dim=512).to(device)
+
+if RESUME_CHECKPOINT:
+    model = load_cascade_model(RESUME_CHECKPOINT, model, device)
+
 criterion = nn.BCEWithLogitsLoss()
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-# Initialize Optimizer with the NEW LOWER LEARNING RATE
-optimizer = torch.optim.Adam(model.parameters(), lr=NEW_LR)
-
-# 5. Checkpoints Directory
-checkpoint_dir = os.path.join(pwd, "trained", "bollywood_faces", "v2")
+checkpoint_dir = os.path.join(pwd, "trained", "bollywood_faces", "v2.32_margin_exit")
 os.makedirs(checkpoint_dir, exist_ok=True)
 
-# --- TRAINING LOOP ---
-# Update range to start from the correct epoch
-TOTAL_EPOCHS = start_epoch + ADDITIONAL_EPOCHS
+log_file = os.path.join(checkpoint_dir, "training_history.log")
+logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s | %(message)s')
+logging.info(f"--- Started Training Cascade Watch Dogs on {device} ---")
 
-print(f"Training for epochs {start_epoch} to {TOTAL_EPOCHS}")
+# ==========================================
+# 5. THE TRAINING & VALIDATION LOOP
+# ==========================================
+EPOCHS = 24
 
-for epoch in range(start_epoch, TOTAL_EPOCHS):
+# Staggered Margins
+MARGIN_HARD = 0.225
+MARGIN_MEDIUM = 0.100
+MARGIN_EASY = 0.000
+
+for epoch in range(3,EPOCHS):
+    # --- TRAINING PHASE ---
     model.train()
     total_loss = 0
-    
-    for i, (e1, e2, y) in enumerate(loader):
+    pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS} [Train]", unit="batch")
+
+    for e1, e2, y in pbar:
         e1, e2, y = e1.to(device), e2.to(device), y.to(device)
-        
-        # 1. Normalize Embeddings
         e1 = F.normalize(e1, p=2, dim=1)
         e2 = F.normalize(e2, p=2, dim=1)
-        
-        # 2. Forward Pass
-        logits = model(e1, e2)
-        
-        # 3. Calculate Loss
-        loss = criterion(logits.view(-1), y.float().view(-1))
 
-        # 4. Backward Pass
+        logits_hard, logits_medium, logits_easy = model(e1, e2)
+        targets = y.float().view(-1)
+
+        target_signs = (2.0 * targets - 1.0)
+
+        adj_hard = logits_hard.view(-1) - (MARGIN_HARD * target_signs)
+        adj_medium = logits_medium.view(-1) - (MARGIN_MEDIUM * target_signs)
+        adj_easy = logits_easy.view(-1) - (MARGIN_EASY * target_signs)
+
+        loss_hard = criterion(adj_hard, targets)
+        loss_medium = criterion(adj_medium, targets)
+        loss_easy = criterion(adj_easy, targets)
+
+        loss = loss_hard + loss_medium + loss_easy
+
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
-        
-        total_loss += loss.item()
 
-        if i % 10 == 0:
-            print(f"Epoch [{epoch}/{TOTAL_EPOCHS}] Batch [{i}/{len(loader)}] | Loss: {loss.item():.4f}", flush=True)
+        current_loss = loss.item()
+        total_loss += current_loss
+        pbar.set_postfix(loss=f"{current_loss:.4f}")
 
-    # Epoch Summary
-    avg_loss = total_loss / len(loader)
-    print(f"=== Epoch {epoch} Completed | Average Loss: {avg_loss:.4f} ===")
+    avg_train_loss = total_loss / len(train_loader)
+
+    # --- VALIDATION PHASE ---
+    model.eval()
+    correct_hard, correct_medium, correct_easy = 0, 0, 0
+    total_val = 0
     
-    # Save Checkpoint
+    print(f"\n[Val] Running validation check on {val_size} pairs...")
+    with torch.no_grad():
+        for e1, e2, y in val_loader:
+            e1, e2, y = e1.to(device), e2.to(device), y.to(device)
+            e1 = F.normalize(e1, p=2, dim=1)
+            e2 = F.normalize(e2, p=2, dim=1)
+            
+            # Use return_all=True to inspect all exits simultaneously
+            logits_hard, logits_medium, logits_easy = model(e1, e2, return_all=True)
+            targets = y.float().view(-1)
+
+            # Convert logits to 0/1 predictions
+            preds_hard = (torch.sigmoid(logits_hard.view(-1)) >= 0.5).float()
+            preds_medium = (torch.sigmoid(logits_medium.view(-1)) >= 0.5).float()
+            preds_easy = (torch.sigmoid(logits_easy.view(-1)) >= 0.5).float()
+
+            correct_hard += (preds_hard == targets).sum().item()
+            correct_medium += (preds_medium == targets).sum().item()
+            correct_easy += (preds_easy == targets).sum().item()
+            total_val += targets.size(0)
+
+    # Calculate independent accuracy for each exit
+    acc_hard = (correct_hard / total_val) * 100
+    acc_medium = (correct_medium / total_val) * 100
+    acc_easy = (correct_easy / total_val) * 100
+
+    summary_msg = (
+        f"Epoch {epoch+1}/{EPOCHS} Summary | Train Loss: {avg_train_loss:.4f} | "
+        f"Hard Acc: {acc_hard:.2f}% | Med Acc: {acc_medium:.2f}% | Easy Acc: {acc_easy:.2f}%"
+    )
+    print(f"=== {summary_msg} ===\n")
+    logging.info(summary_msg)
+
     save_path = os.path.join(checkpoint_dir, f"epoch_{epoch}.pth")
     torch.save(model.state_dict(), save_path)
-    print(f"Saved checkpoint: {save_path}\n")
 
-print("Fine-tuning Complete.")
+print("Training Complete.")
