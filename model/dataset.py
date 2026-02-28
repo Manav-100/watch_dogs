@@ -32,9 +32,9 @@ class PairDataset(Dataset):
         return 100000  
 
     def _load(self, path):
-        # FIX: Keep as BGR! Do NOT convert to RGB.
-        # InsightFace expects BGR inputs.
-        return cv2.imread(path)
+        # Load as BGR (OpenCV Default)
+        img = cv2.imread(path)
+        return img
 
     def __getitem__(self, idx):
         same = random.random() < 0.5
@@ -49,25 +49,28 @@ class PairDataset(Dataset):
             path2 = random.choice(self.image_index[pid2])
             label = 0.0
 
-        img1 = self._load(path1)
-        # Load img2 and apply distortion
-        # Note: Distortion pipeline should be robust to BGR, or just noise/blur which is color-agnostic
-        img2_raw = self._load(path2)
+        img1_bgr = self._load(path1)
+        img2_raw_bgr = self._load(path2)
         
-        if img1 is None or img2_raw is None:
+        if img1_bgr is None or img2_raw_bgr is None:
             return self.__getitem__(idx) # Retry if load fails
 
         try:
-            # Apply distortion
-            img2 = self.distorter(image=img2_raw)["image"]
+            # 1. Convert BGR to RGB for the distortion pipeline
+            img2_rgb = cv2.cvtColor(img2_raw_bgr, cv2.COLOR_BGR2RGB)
+            
+            # 2. Apply distortion
+            distorted_rgb = self.distorter(image=img2_rgb)["image"]
+            
+            # 3. Convert back to BGR for InsightFace
+            img2_bgr = cv2.cvtColor(distorted_rgb, cv2.COLOR_RGB2BGR)
         except Exception as e:
             # Fallback if distortion fails
-            img2 = img2_raw
+            img2_bgr = img2_raw_bgr
 
-        # Get Embeddings (Now working on correct BGR images)
-        # Note: We rely on train.py to do the L2 Normalization (F.normalize)
-        e1 = self.encoder.get_feat(img1)
-        e2 = self.encoder.get_feat(img2)
+        # Get Embeddings (Strictly using BGR images)
+        e1 = self.encoder.get_feat(img1_bgr)
+        e2 = self.encoder.get_feat(img2_bgr)
 
         if e1 is None or e2 is None:
             return self.__getitem__(idx)
