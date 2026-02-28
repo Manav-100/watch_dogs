@@ -1,4 +1,3 @@
-# detector.py
 import numpy as np
 from insightface.app.face_analysis import FaceAnalysis
 
@@ -39,7 +38,7 @@ class FaceDetector:
                 "face":frame[y1:y2, x1:x2] if not self.embed else None,
                 "embedding": face.normed_embedding.astype(np.float32) if self.embed else None
             })
-        if results is not None:
-            print(f"Detected  face")
+        if results: 
+            print(f"Detected {len(results)} face(s)")
         return results
     
