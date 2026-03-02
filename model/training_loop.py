@@ -1,4 +1,3 @@
-
 import sys
 import os
 import time
@@ -24,69 +23,59 @@ except ImportError as e:
     print(f"[CRITICAL ERROR] Failed to import modules. Ensure you are running this from your repo root.\nError: {e}")
     sys.exit(1)
 
-# Enable CUDNN Benchmarking for optimized hardware operations
 if torch.cuda.is_available():
     torch.backends.cudnn.benchmark = True
 
 # ==========================================
-# 2. INVERTED CASCADE ARCHITECTURE
+# 2. 2-EXIT INVERTED CASCADE ARCHITECTURE
 # ==========================================
 class AttentionHead(nn.Module):
     def __init__(self, dim=512):
         super().__init__()
         
-        # 1. THE HARD EXIT (Evaluated First)
+        # 1. THE HARD EXIT (Evaluated First, Massive Capacity)
         self.layer1_hard = nn.Linear(dim * 2, 512)
         self.hard_classifier = nn.Sequential(
             nn.ReLU(), nn.Linear(512, 128),
             nn.ReLU(), nn.Linear(128, 1)
         )
 
-        # 2. THE MEDIUM EXIT (Evaluated Second)
-        self.layer2_medium = nn.Linear(512, 128)
-        self.medium_classifier = nn.Sequential(
-            nn.ReLU(), nn.Linear(128, 64),
-            nn.ReLU(), nn.Linear(64, 1)
-        )
-
-        # 3. THE EASY EXIT (Fallback)
-        self.layer3_easy = nn.Linear(128, 16)
+        # 2. THE EASY EXIT (Fallback, Low Capacity)
+        # Slices the 512 down to 32
+        self.layer2_easy = nn.Linear(512, 32)
         self.easy_classifier = nn.Sequential(
-            nn.ReLU(), nn.Linear(16, 8),
-            nn.ReLU(), nn.Linear(8, 1)
+            nn.ReLU(), nn.Linear(32, 16),
+            nn.ReLU(), nn.Linear(16, 1)
         )
 
-    def forward(self, e1, e2, thresholds=(0.9999, 0.99), return_all=False):
+    # Threshold set to 99.9% to target the 10^-3 to 10^-4 FAR range
+    def forward(self, e1, e2, threshold=0.999, return_all=False):
         concat = torch.cat([e1, e2], dim=1) 
 
+        # Pass 1: Hard
         x_hard = self.layer1_hard(concat)
         logits_hard = self.hard_classifier(x_hard)
 
-        x_medium = self.layer2_medium(F.relu(x_hard))
-        logits_medium = self.medium_classifier(x_medium)
-
-        x_easy = self.layer3_easy(F.relu(x_medium))
+        # Pass 2: Easy
+        x_easy = self.layer2_easy(F.relu(x_hard))
         logits_easy = self.easy_classifier(x_easy)
 
         if self.training or return_all:
-            return logits_hard, logits_medium, logits_easy
+            return logits_hard, logits_easy
 
         # --- INFERENCE ROUTING ---
         prob_hard = torch.sigmoid(logits_hard)
-        prob_medium = torch.sigmoid(logits_medium)
-
-        conf_hard = torch.max(prob_hard, 1.0 - prob_hard)
-        conf_medium = torch.max(prob_medium, 1.0 - prob_medium)
         
-        thresh_hard, thresh_medium = thresholds
+        # Calculate confidence
+        conf_hard = torch.max(prob_hard, 1.0 - prob_hard)
+        
+        # Routing Logic
+        use_hard = (conf_hard >= threshold)    # Exit 1: >= 99.9%
+        use_easy = (~use_hard)                 # Exit 2: Below 99.9%
 
-        use_hard = (conf_hard >= thresh_hard)                           
-        use_medium = (~use_hard) & (conf_medium >= thresh_medium)       
-        use_easy = (~use_hard) & (~use_medium)                          
-
+        # Select the winning logit
         final_logits = torch.zeros_like(logits_hard)
         final_logits[use_hard] = logits_hard[use_hard]
-        final_logits[use_medium] = logits_medium[use_medium]
         final_logits[use_easy] = logits_easy[use_easy]
 
         return final_logits
@@ -110,41 +99,39 @@ if __name__ == "__main__":
 
     cached_data = torch.load(cache_path)
     
-    # Create a blazing fast TensorDataset
     dataset = torch.utils.data.TensorDataset(
         cached_data['e1'], 
         cached_data['e2'], 
         cached_data['y']
     )
     
-    
     loader = DataLoader(
         dataset, 
-        batch_size=64, # Increased heavily to saturate the GPU
+        batch_size=64, 
         shuffle=True, 
         num_workers=0, 
         pin_memory=True
     )
+    
     model = AttentionHead(dim=512).to(device)
     criterion = nn.BCEWithLogitsLoss()
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-    # GPU OPTIMIZATION: Gradient Scaler for Mixed Precision
     scaler = torch.amp.GradScaler('cuda')
 
-    checkpoint_dir = os.path.join(REPO_DIR, "trained", "bollywood_faces", "v2.16_margin_exit_threshold")
+    # Saved to a new specific directory
+    checkpoint_dir = os.path.join(REPO_DIR, "trained", "bollywood_faces", "v2.32_with_512_margin_exit")
     os.makedirs(checkpoint_dir, exist_ok=True)
 
     log_file = os.path.join(checkpoint_dir, "training_history.log")
     logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s | %(message)s')
-    logging.info(f"--- Started Training Inverted Cascade (Mixed Precision) on {device} ---")
+    logging.info(f"--- Started Training 2-Exit Cascade on {device} ---")
 
     # ==========================================
     # 4. HIGH-PERFORMANCE TRAINING LOOP
     # ==========================================
     EPOCHS = 4
     MARGIN_HARD = 0.25
-    MARGIN_MEDIUM = 0.10
     MARGIN_EASY = 0.000
 
     for epoch in range(EPOCHS):
@@ -153,7 +140,6 @@ if __name__ == "__main__":
         pbar = tqdm(loader, desc=f"Epoch {epoch+1}/{EPOCHS}", unit="batch")
 
         for e1, e2, y in pbar:
-            # GPU OPTIMIZATION: non_blocking=True allows async data transfers
             e1 = e1.to(device, non_blocking=True)
             e2 = e2.to(device, non_blocking=True)
             y = y.to(device, non_blocking=True)
@@ -163,22 +149,17 @@ if __name__ == "__main__":
             targets = y.float().view(-1)
             target_signs = (2.0 * targets - 1.0)
 
-            # GPU OPTIMIZATION: Autocast for Mixed Precision Forward Pass
             with torch.amp.autocast('cuda'):
-                logits_hard, logits_medium, logits_easy = model(e1, e2)
+                logits_hard, logits_easy = model(e1, e2)
 
                 adj_hard = logits_hard.view(-1) - (MARGIN_HARD * target_signs)
-                adj_medium = logits_medium.view(-1) - (MARGIN_MEDIUM * target_signs)
                 adj_easy = logits_easy.view(-1) - (MARGIN_EASY * target_signs)
 
                 loss_hard = criterion(adj_hard, targets)
-                loss_medium = criterion(adj_medium, targets)
                 loss_easy = criterion(adj_easy, targets)
 
-                loss = loss_hard + loss_medium + loss_easy
+                loss = loss_hard + loss_easy
 
-            # GPU OPTIMIZATION: Scaled Backward Pass
-            # set_to_none=True is slightly faster than standard zero_grad()
             optimizer.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.step(optimizer)
