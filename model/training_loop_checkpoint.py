@@ -24,57 +24,69 @@ except ImportError as e:
     sys.exit(1)
 
 # ==========================================
-# 2. INLINE MODEL DEFINITION (MULTI-EXIT)
+# 2. INLINE MODEL DEFINITION (INVERTED CASCADE)
 # ==========================================
 class AttentionHead(nn.Module):
     def __init__(self, dim=512):
         super().__init__()
         # Concatenated input is 1024 (dim * 2)
 
-        # 1. THE HARD EXIT
+        # 1. THE HARD EXIT (Evaluated First, Massive Capacity)
         self.layer1_hard = nn.Linear(dim * 2, 512)
         self.hard_classifier = nn.Sequential(
             nn.ReLU(), nn.Linear(512, 128),
             nn.ReLU(), nn.Linear(128, 1)
         )
 
-        # 2. THE MEDIUM EXIT
+        # 2. THE MEDIUM EXIT (Evaluated Second, Medium Capacity)
         self.layer2_medium = nn.Linear(512, 128)
         self.medium_classifier = nn.Sequential(
             nn.ReLU(), nn.Linear(128, 64),
             nn.ReLU(), nn.Linear(64, 1)
-        )
+        )   
 
-        # 3. THE EASY EXIT
-        self.layer3_easy = nn.Linear(128, 32)
+        # 3. THE EASY EXIT (Evaluated Last, Low Capacity Fallback)
+        self.layer3_easy = nn.Linear(128, 16)
         self.easy_classifier = nn.Sequential(
-            nn.ReLU(), nn.Linear(32, 16),
-            nn.ReLU(), nn.Linear(16, 1)
+            nn.ReLU(), nn.Linear(16, 8),
+            nn.ReLU(), nn.Linear(8, 1)
         )
 
-    def forward(self, e1, e2, confidence_threshold=1.5, return_all=False):
-        concat = torch.cat([e1, e2], dim=1)
+    # Thresholds: 99.99% for Hard layer, 99.00% for Medium layer
+    def forward(self, e1, e2, thresholds=(0.9999, 0.99), return_all=False):
+        concat = torch.cat([e1, e2], dim=1) # Shape: [Batch, 1024]
 
+        # Pass 1: Hard
         x_hard = self.layer1_hard(concat)
         logits_hard = self.hard_classifier(x_hard)
 
+        # Pass 2: Medium
         x_medium = self.layer2_medium(F.relu(x_hard))
         logits_medium = self.medium_classifier(x_medium)
 
+        # Pass 3: Easy
         x_easy = self.layer3_easy(F.relu(x_medium))
         logits_easy = self.easy_classifier(x_easy)
 
-        # Return all logits if training OR if explicitly requested for validation scoring
         if self.training or return_all:
             return logits_hard, logits_medium, logits_easy
 
-        conf_hard = torch.abs(logits_hard)
-        conf_medium = torch.abs(logits_medium)
+        # --- INFERENCE ROUTING (Probability Based) ---
+        prob_hard = torch.sigmoid(logits_hard)
+        prob_medium = torch.sigmoid(logits_medium)
 
-        use_hard = (conf_hard >= confidence_threshold)
-        use_medium = (~use_hard) & (conf_medium >= confidence_threshold)
-        use_easy = (~use_hard) & (~use_medium)
+        # Calculate confidence (distance from 0.5 guessing point)
+        conf_hard = torch.max(prob_hard, 1.0 - prob_hard)
+        conf_medium = torch.max(prob_medium, 1.0 - prob_medium)
+        
+        thresh_hard, thresh_medium = thresholds
 
+        # Routing Logic
+        use_hard = (conf_hard >= thresh_hard)                           # Exit 1: >= 99.99%
+        use_medium = (~use_hard) & (conf_medium >= thresh_medium)       # Exit 2: >= 99.00%
+        use_easy = (~use_hard) & (~use_medium)                          # Exit 3: Below 99.00%
+
+        # Select the winning logit
         final_logits = torch.zeros_like(logits_hard)
         final_logits[use_hard] = logits_hard[use_hard]
         final_logits[use_medium] = logits_medium[use_medium]
@@ -100,7 +112,6 @@ def load_cascade_model(checkpoint_path, model, device):
         print(f"[LOADER] CRITICAL ERROR during loading: {e}. Starting fresh.")
     
     return model
-
 # ==========================================
 # 4. TRAINING CONFIGURATION & DATA SPLIT
 # ==========================================
@@ -108,15 +119,23 @@ pwd = os.getcwd()
 device = "cuda" if torch.cuda.is_available() else "cpu"
 print(f"Training on: {device}")
 
-RESUME_CHECKPOINT = "D:\\cctv\\watch_dogs\\trained\\bollywood_faces\\v2.32_margin_exit\\epoch_3.pth" 
+checkpoint_dir= os.path.join(REPO_DIR, "trained", "bollywood_faces", "v2.16_margin_exit_threshold")
+os.makedirs(checkpoint_dir, exist_ok=True)
+RESUME_CHECKPOINT = os.path.join(checkpoint_dir, "epoch_3.pth")
 
-print("[INIT] Loading Face Detector...")
-detector = FaceDetector(device=device, embed=True)
+print("[INIT] Loading Cached Embeddings directly to RAM...")
+# Make sure you generated this file for ms1m-arcface!
+cache_path = "D:\\cctv\\watch_dogs\\datasets\\ms1m-arcface\\embedding_cache(3,5).pt"
 
-print("[INIT] Loading Dataset...")
-full_dataset = PairDataset(
-    parent_dir="D:\\cctv\\watch_dogs\\ms1m-arcface",
-    encoder=detector.app.models['recognition']
+if not os.path.exists(cache_path):
+    print(f"[CRITICAL ERROR] Cache not found at {cache_path}. Run cache_dataset.py first!")
+    sys.exit(1)
+
+cached_data = torch.load(cache_path)
+full_dataset = torch.utils.data.TensorDataset(
+    cached_data['e1'], 
+    cached_data['e2'], 
+    cached_data['y']
 )
 
 # Split dataset into 90% Training, 10% Validation
@@ -124,34 +143,31 @@ val_size = int(len(full_dataset) * 0.1)
 train_size = len(full_dataset) - val_size
 train_dataset, val_dataset = random_split(full_dataset, [train_size, val_size])
 
-train_loader = DataLoader(train_dataset, batch_size=64, shuffle=True)
-val_loader = DataLoader(val_dataset, batch_size=64, shuffle=False)
+# 2. INCREASE BATCH SIZE (Since it's in RAM, we can push this to 1024 or 2048)
+train_loader = DataLoader(train_dataset, batch_size=1024, shuffle=True, num_workers=0, pin_memory=True)
+val_loader = DataLoader(val_dataset, batch_size=1024, shuffle=False, num_workers=0, pin_memory=True)
 
 print(f"[INIT] Total Pairs: {len(full_dataset)} | Training: {train_size} | Validation: {val_size}")
 
 model = AttentionHead(dim=512).to(device)
 
-if RESUME_CHECKPOINT:
+if RESUME_CHECKPOINT and os.path.exists(RESUME_CHECKPOINT):
     model = load_cascade_model(RESUME_CHECKPOINT, model, device)
+else:
+    print("[WARNING] RESUME_CHECKPOINT not found. Starting with fresh weights!")
 
 criterion = nn.BCEWithLogitsLoss()
 optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
 
-checkpoint_dir = os.path.join(pwd, "trained", "bollywood_faces", "v2.32_margin_exit")
-os.makedirs(checkpoint_dir, exist_ok=True)
-
-log_file = os.path.join(checkpoint_dir, "training_history.log")
-logging.basicConfig(filename=log_file, level=logging.INFO, format='%(asctime)s | %(message)s')
-logging.info(f"--- Started Training Cascade Watch Dogs on {device} ---")
-
+# ... (Continue to checkpoint_dir setup)
 # ==========================================
 # 5. THE TRAINING & VALIDATION LOOP
 # ==========================================
-EPOCHS = 24
+EPOCHS = 60
 
-# Staggered Margins
-MARGIN_HARD = 0.225
-MARGIN_MEDIUM = 0.100
+# Staggered Margins 
+MARGIN_HARD = 0.50
+MARGIN_MEDIUM = 0.20
 MARGIN_EASY = 0.000
 
 for epoch in range(3,EPOCHS):
@@ -165,15 +181,18 @@ for epoch in range(3,EPOCHS):
         e1 = F.normalize(e1, p=2, dim=1)
         e2 = F.normalize(e2, p=2, dim=1)
 
+        # Unpack order matches the new forward output (Hard -> Medium -> Easy)
         logits_hard, logits_medium, logits_easy = model(e1, e2)
         targets = y.float().view(-1)
 
         target_signs = (2.0 * targets - 1.0)
 
+        # Apply specific margins
         adj_hard = logits_hard.view(-1) - (MARGIN_HARD * target_signs)
         adj_medium = logits_medium.view(-1) - (MARGIN_MEDIUM * target_signs)
         adj_easy = logits_easy.view(-1) - (MARGIN_EASY * target_signs)
 
+        # Calculate losses
         loss_hard = criterion(adj_hard, targets)
         loss_medium = criterion(adj_medium, targets)
         loss_easy = criterion(adj_easy, targets)
